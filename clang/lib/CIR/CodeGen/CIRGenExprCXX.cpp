@@ -886,11 +886,11 @@ mlir::Value CIRGenFunction::emitCXXNewExpr(const CXXNewExpr *e) {
   if (nullCheck)
     cgm.errorNYI(e->getSourceRange(), "emitCXXNewExpr: null check");
 
-  // If there's an operator delete, enter a cleanup to call it if an
-  // exception is thrown.
-  if (e->getOperatorDelete() &&
-      !e->getOperatorDelete()->isReservedGlobalPlacementOperator())
-    cgm.errorNYI(e->getSourceRange(), "emitCXXNewExpr: operator delete");
+  // // If there's an operator delete, enter a cleanup to call it if an
+  // // exception is thrown.
+  // if (e->getOperatorDelete() &&
+  //     !e->getOperatorDelete()->isReservedGlobalPlacementOperator())
+  //   cgm.errorNYI(e->getSourceRange(), "emitCXXNewExpr: operator delete");
 
   if (allocSize != allocSizeWithoutCookie) {
     assert(e->isArray());
@@ -919,8 +919,73 @@ mlir::Value CIRGenFunction::emitCXXNewExpr(const CXXNewExpr *e) {
 
   assert(!cir::MissingFeatures::sanitizers());
 
-  emitNewInitializer(*this, e, allocType, elementTy, result, numElements,
-                     allocSizeWithoutCookie);
+  // If there's an operator delete, enter a cleanup to call it if an
+  // exception is thrown.
+  if (e->getOperatorDelete() &&
+      !e->getOperatorDelete()->isReservedGlobalPlacementOperator()) {
+    auto loc = getLoc(e->getSourceRange());
+
+    mlir::OpBuilder::InsertPoint beginInsertTryBody;
+
+    // Create a synthetic try-cleanup block to ensure operator delete is called
+    // if the constructor throws an exception
+    auto tryOp = cir::TryOp::create(
+        builder, loc,
+        /*tryBuilder=*/
+        [&](mlir::OpBuilder &b, mlir::Location loc) {
+          beginInsertTryBody = builder.saveInsertionPoint();
+        },
+        /*handlersBuilder=*/
+        [&](mlir::OpBuilder &b, mlir::Location loc,
+            mlir::OperationState &result) {
+          mlir::OpBuilder::InsertionGuard guard(b);
+          // Create one handler region for the cleanup
+          mlir::Region *region = result.addRegion();
+          builder.createBlock(region);
+        });
+
+    // Set synthetic and cleanup attributes
+    tryOp.setSyntheticAttr(builder.getUnitAttr());
+    tryOp.setCleanupAttr(builder.getUnitAttr());
+
+    // Set handler type to 'unwind' so the cleanup handler region is printed
+    llvm::SmallVector<mlir::Attribute, 1> handlerAttrs;
+    handlerAttrs.push_back(cir::UnwindAttr::get(builder.getContext()));
+    tryOp.setHandlerTypesAttr(builder.getArrayAttr(handlerAttrs));
+
+    // Build the try region - contains the constructor call
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.restoreInsertionPoint(beginInsertTryBody);
+
+      // Call the constructor
+      emitNewInitializer(*this, e, allocType, elementTy, result, numElements,
+                         allocSizeWithoutCookie);
+
+      // Normal exit from try region
+      cir::YieldOp::create(builder, loc);
+    }
+
+    // Build the unwind region - cleanup if constructor throws
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      mlir::Region &unwindRegion = tryOp.getHandlerRegions()[0];
+      builder.setInsertionPointToStart(&unwindRegion.front());
+
+      // Cleanup: call operator delete to free the allocated memory
+      const FunctionDecl *operatorDelete = e->getOperatorDelete();
+      emitDeleteCall(operatorDelete, allocation.getPointer(), allocType);
+
+      // Terminate the unwind region - exception continues unwinding after
+      // cleanup
+      cir::YieldOp::create(builder, loc);
+    }
+  } else {
+    // No exception cleanup needed - just initialize normally
+    emitNewInitializer(*this, e, allocType, elementTy, result, numElements,
+                       allocSizeWithoutCookie);
+  }
+
   return result.getPointer();
 }
 
